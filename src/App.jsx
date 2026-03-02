@@ -1,83 +1,98 @@
 import { useEffect, useMemo, useState } from 'react'
-import beautify from 'js-beautify'
+import { format as prettierFormat } from 'prettier/standalone'
+import * as prettierPluginBabel from 'prettier/plugins/babel'
+import * as prettierPluginEstree from 'prettier/plugins/estree'
 import { highlightCode } from './highlight'
 import './App.css'
 
 const STORAGE_KEY = 'component-template-copier.templates.v1'
-
-const DEFAULT_TEMPLATES = [
-  {
-    id: 'btn-primary',
-    name: 'PrimaryButton',
-    language: 'jsx',
-    content: `import { PrimaryButton } from '@/components/shared/PrimaryButton'
-
-export default function Example() {
-  // Nhan vao de submit form
-  const handleClick = () => {
-    console.log('Submitted')
-  }
-
-  return (
-    <PrimaryButton onClick={handleClick} size="lg">
-      Submit form
-    </PrimaryButton>
-  )
-}`,
-  },
-  {
-    id: 'modal-basic',
-    name: 'BasicModal',
-    language: 'jsx',
-    content: `import { BasicModal } from '@/components/shared/BasicModal'
-
-export function Page() {
-  const [open, setOpen] = useState(false)
-
-  return (
-    <>
-      <button onClick={() => setOpen(true)}>Open modal</button>
-      <BasicModal open={open} onClose={() => setOpen(false)}>
-        {/* Noi dung modal */}
-        <p>Hello world</p>
-      </BasicModal>
-    </>
-  )
-}`,
-  },
-  {
-    id: 'table-config',
-    name: 'TableConfigJson',
-    language: 'json',
-    content: `{
-  "columns": [
-    { "key": "name", "title": "Name" },
-    { "key": "email", "title": "Email" }
-  ],
-  "pagination": true,
-  "pageSize": 20
-}`,
-  },
-]
-
-function readTemplates() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return DEFAULT_TEMPLATES
-
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return DEFAULT_TEMPLATES
-
-    return parsed.filter((item) => item && item.id && item.name && item.language && item.content)
-  } catch {
-    return DEFAULT_TEMPLATES
-  }
-}
+const API_BASE_URL = 'https://663484909bb0df2359a1be82.mockapi.io'
+const TEMPLATE_API_URL = `${API_BASE_URL}/template-component`
+const SUPPORTED_TYPES = ['jsx', 'json', 'text']
+const REQUEST_WARNING = 'Tất cả các request bạn đang dùng là free nên hãy tiết kiệm nhé'
 
 const EMPTY_FORM = {
   name: '',
   language: 'jsx',
   content: '',
+}
+
+function indicesToRanges(indices) {
+  if (!indices.length) return []
+  const ranges = []
+  let start = indices[0]
+  let prev = indices[0]
+
+  for (let i = 1; i < indices.length; i += 1) {
+    const current = indices[i]
+    if (current === prev + 1) {
+      prev = current
+      continue
+    }
+    ranges.push({ start, end: prev + 1 })
+    start = current
+    prev = current
+  }
+
+  ranges.push({ start, end: prev + 1 })
+  return ranges
+}
+
+function matchTemplateName(name, query) {
+  const source = name.toLowerCase()
+  const keyword = query.toLowerCase().trim()
+  if (!keyword) return { ranges: [], score: 0 }
+
+  const contiguousStart = source.indexOf(keyword)
+  if (contiguousStart >= 0) {
+    return {
+      ranges: [{ start: contiguousStart, end: contiguousStart + keyword.length }],
+      score: 1000 - contiguousStart,
+    }
+  }
+
+  const indices = []
+  let cursor = 0
+  for (const char of keyword) {
+    const foundIndex = source.indexOf(char, cursor)
+    if (foundIndex < 0) return null
+    indices.push(foundIndex)
+    cursor = foundIndex + 1
+  }
+
+  const spread = indices[indices.length - 1] - indices[0]
+  return {
+    ranges: indicesToRanges(indices),
+    score: 100 - spread,
+  }
+}
+
+function normalizeType(type) {
+  return SUPPORTED_TYPES.includes(type) ? type : 'text'
+}
+
+function normalizeTemplate(item) {
+  if (!item || !item.id || !item.name) return null
+
+  const language = normalizeType(item.language ?? item.type)
+  const content = item.content ?? item.value
+
+  if (typeof content !== 'string') return null
+
+  return {
+    id: String(item.id),
+    name: String(item.name),
+    language,
+    content,
+  }
+}
+
+function toApiPayload(template) {
+  return {
+    name: template.name,
+    type: template.language,
+    value: template.content,
+  }
 }
 
 function normalizeTextWhitespace(content, trimBoundary = true) {
@@ -90,15 +105,123 @@ function normalizeTextWhitespace(content, trimBoundary = true) {
   return trimBoundary ? normalized.trim() : normalized
 }
 
-const jsBeautify = beautify.js_beautify
+function isPureJsxSnippet(content) {
+  const trimmed = content.trim()
+  return trimmed.startsWith('<') && trimmed.endsWith('>')
+}
+
+function isJsxCommentThenMarkup(content) {
+  const trimmed = content.trim()
+  return /^\{\/\*[\s\S]*?\*\/\}\s*</.test(trimmed)
+}
+
+function normalizeLeadingLineJsxComments(content) {
+  const lines = content.replace(/\r\n?/g, '\n').split('\n')
+  const converted = []
+  let index = 0
+
+  while (index < lines.length) {
+    const line = lines[index]
+    const trimmed = line.trim()
+
+    if (!trimmed) {
+      converted.push(line)
+      index += 1
+      continue
+    }
+
+    if (trimmed.startsWith('//')) {
+      const indent = line.match(/^\s*/)?.[0] ?? ''
+      const comment = trimmed.slice(2).trim()
+      converted.push(`${indent}{/* ${comment} */}`)
+      index += 1
+      continue
+    }
+
+    break
+  }
+
+  const rest = lines.slice(index).join('\n').trimStart()
+  if (!rest.startsWith('<')) return content
+
+  return [...converted, rest].filter(Boolean).join('\n')
+}
+
+function normalizeBrokenLeadingJsxComment(content) {
+  const match = content.match(/^\s*\{\s*\/\*([\s\S]*?)\*\/\s*\}\s*;?\s*/)
+  if (!match) return content
+
+  const normalizedComment = `{/*${match[1]}*/}\n`
+  return normalizedComment + content.slice(match[0].length).trimStart()
+}
+
+function extractWrappedJsx(formatted) {
+  const match = formatted.match(/const __CODEX_TEMP__ = \(\n([\s\S]*?)\n\)\n?;?$/)
+  return match ? match[1] : formatted
+}
+
+function extractWrappedJsxFragment(formatted) {
+  const match = formatted.match(/const __CODEX_TEMP__ = \(\n<>\n([\s\S]*?)\n<\/>\n\)\n?;?$/)
+  return match ? match[1] : formatted
+}
+
+function stripCommonIndent(content) {
+  const lines = content.split('\n')
+  const nonEmpty = lines.filter((line) => line.trim())
+  if (!nonEmpty.length) return content
+
+  const minIndent = Math.min(
+    ...nonEmpty.map((line) => {
+      const match = line.match(/^ */)
+      return match ? match[0].length : 0
+    }),
+  )
+
+  if (!minIndent) return content
+  return lines.map((line) => line.slice(minIndent)).join('\n')
+}
+
+function readTemplates() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return []
+
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+
+    const normalized = parsed.map(normalizeTemplate).filter(Boolean)
+    return normalized
+  } catch {
+    return []
+  }
+}
+
+async function requestJson(url, options = {}) {
+  const response = await fetch(url, {
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    },
+    ...options,
+  })
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`)
+  }
+
+  return response.json()
+}
 
 export default function App() {
   const [templates, setTemplates] = useState(readTemplates)
   const [selectedId, setSelectedId] = useState(() => readTemplates()[0]?.id ?? null)
   const [editingId, setEditingId] = useState(undefined)
   const [form, setForm] = useState(EMPTY_FORM)
+  const [searchInput, setSearchInput] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
   const [isFormatting, setIsFormatting] = useState(false)
   const [autoFormatOnPaste, setAutoFormatOnPaste] = useState(true)
+  const [isSyncing, setIsSyncing] = useState(false)
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(templates))
@@ -108,23 +231,81 @@ export default function App() {
     }
   }, [templates, selectedId])
 
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedSearch(searchInput)
+    }, 300)
+
+    return () => window.clearTimeout(timer)
+  }, [searchInput])
+
   const selectedTemplate = useMemo(
     () => templates.find((item) => item.id === selectedId) ?? null,
     [templates, selectedId],
   )
+
+  const filteredTemplates = useMemo(() => {
+    const keyword = debouncedSearch.trim()
+    if (!keyword) return templates.map((item) => ({ ...item, highlightRanges: [] }))
+
+    return templates
+      .map((item) => {
+        const match = matchTemplateName(item.name, keyword)
+        if (!match) return null
+        return {
+          ...item,
+          highlightRanges: match.ranges,
+          _score: match.score,
+        }
+      })
+      .filter(Boolean)
+      .sort((a, b) => b._score - a._score)
+  }, [templates, debouncedSearch])
 
   const highlightedCode = useMemo(() => {
     if (!selectedTemplate) return ''
     return highlightCode(selectedTemplate.content, selectedTemplate.language)
   }, [selectedTemplate])
 
+  const renderHighlightedName = (name, ranges) => {
+    if (!ranges.length) return name
+
+    const nodes = []
+    let cursor = 0
+
+    ranges.forEach((range, index) => {
+      if (cursor < range.start) {
+        nodes.push(<span key={`plain-${index}-${cursor}`}>{name.slice(cursor, range.start)}</span>)
+      }
+      nodes.push(
+        <span key={`match-${index}-${range.start}`} className="name-highlight">
+          {name.slice(range.start, range.end)}
+        </span>,
+      )
+      cursor = range.end
+    })
+
+    if (cursor < name.length) {
+      nodes.push(<span key={`plain-tail-${cursor}`}>{name.slice(cursor)}</span>)
+    }
+
+    return nodes
+  }
+
   const startCreate = () => {
+    const ok = window.confirm(`Add template?\n\n${REQUEST_WARNING}`)
+    if (!ok) return
+
     setEditingId(null)
     setForm(EMPTY_FORM)
   }
 
   const startEdit = () => {
     if (!selectedTemplate) return
+
+    const ok = window.confirm(`Edit template "${selectedTemplate.name}"?\n\n${REQUEST_WARNING}`)
+    if (!ok) return
+
     setEditingId(selectedTemplate.id)
     setForm({
       name: selectedTemplate.name,
@@ -140,22 +321,42 @@ export default function App() {
 
   const formatByLanguage = async (content, language, trimBoundary = true) => {
     if (language === 'jsx') {
-      const formatted = jsBeautify(content, {
-        indent_char: ' ',
-        indent_size: 2,
-        preserve_newlines: true,
-        max_preserve_newlines: 2,
-        e4x: true,
-        brace_style: 'collapse',
-        wrap_line_length: 0,
-        end_with_newline: false,
+      const normalizedInput = normalizeLeadingLineJsxComments(
+        normalizeBrokenLeadingJsxComment(content),
+      )
+      const wrapAsFragment = isJsxCommentThenMarkup(normalizedInput)
+      const wrapAsSingleJsx = isPureJsxSnippet(normalizedInput)
+
+      const source = wrapAsFragment
+        ? `const __CODEX_TEMP__ = (\n<>\n${normalizedInput.trim()}\n</>\n)\n`
+        : wrapAsSingleJsx
+          ? `const __CODEX_TEMP__ = (\n${normalizedInput.trim()}\n)\n`
+          : normalizedInput
+
+      const formatted = await prettierFormat(source, {
+        parser: 'babel',
+        plugins: [prettierPluginBabel, prettierPluginEstree],
+        semi: false,
+        singleQuote: true,
+        tabWidth: 2,
+        trailingComma: 'es5',
+        printWidth: 100,
       })
-      return trimBoundary ? formatted.trim() : formatted
+
+      const result = wrapAsFragment
+        ? stripCommonIndent(extractWrappedJsxFragment(formatted))
+        : wrapAsSingleJsx
+          ? stripCommonIndent(extractWrappedJsx(formatted))
+          : formatted
+      return trimBoundary ? result.trim() : result
     }
 
     if (language === 'json') {
-      const parsed = JSON.parse(content)
-      const formatted = JSON.stringify(parsed, null, 2)
+      const formatted = await prettierFormat(content, {
+        parser: 'json',
+        plugins: [prettierPluginBabel, prettierPluginEstree],
+        tabWidth: 2,
+      })
       return trimBoundary ? formatted.trim() : formatted
     }
 
@@ -170,7 +371,7 @@ export default function App() {
       const formatted = await formatByLanguage(form.content, form.language)
       setForm((prev) => ({ ...prev, content: formatted }))
     } catch {
-      alert('Format that bai. Kiem tra lai noi dung va kieu du lieu.')
+      alert('Format failed. Please check the content and selected type.')
     } finally {
       setIsFormatting(false)
     }
@@ -191,65 +392,113 @@ export default function App() {
       const nextRawContent =
         form.content.slice(0, selectionStart) + pasted + form.content.slice(selectionEnd)
 
-      // Re-format the whole editor content to keep indentation consistent after paste.
-      const nextFormattedContent =
-        form.language === 'jsx'
-          ? await formatByLanguage(nextRawContent, form.language, false)
-          : nextRawContent
+      const shouldAutoFormat = form.language === 'jsx'
+      const nextFormattedContent = shouldAutoFormat
+        ? await formatByLanguage(nextRawContent, form.language, false)
+        : nextRawContent
 
       setForm((prev) => ({ ...prev, content: nextFormattedContent }))
     } catch {
-      alert('Noi dung paste khong format duoc theo kieu du lieu hien tai.')
+      alert('Cannot format pasted content with the current type.')
     } finally {
       setIsFormatting(false)
     }
   }
 
-  const saveTemplate = (event) => {
+  const refetchTemplates = async () => {
+    try {
+      setIsSyncing(true)
+      const serverList = await requestJson(TEMPLATE_API_URL)
+      const normalized = Array.isArray(serverList) ? serverList.map(normalizeTemplate).filter(Boolean) : []
+
+      setTemplates(normalized)
+      setSelectedId(normalized[0]?.id ?? null)
+      alert('Latest templates were fetched from the server.')
+    } catch {
+      alert('Refetch failed. Could not load data from server.')
+    } finally {
+      setIsSyncing(false)
+    }
+  }
+
+  const saveTemplate = async (event) => {
     event.preventDefault()
     const nextName = form.name.trim()
     const nextContent = form.content.trim()
 
     if (!nextName || !nextContent) {
-      alert('Ten va noi dung khong duoc de trong.')
+      alert('Name and content are required.')
       return
     }
 
-    if (editingId === null) {
-      const newId = `${Date.now()}`
-      const newTemplate = {
-        id: newId,
-        name: nextName,
-        language: form.language,
-        content: form.content,
-      }
-      setTemplates((prev) => [newTemplate, ...prev])
-      setSelectedId(newId)
-    } else {
-      setTemplates((prev) =>
-        prev.map((item) =>
-          item.id === editingId
-            ? {
-                ...item,
-                name: nextName,
-                language: form.language,
-                content: form.content,
-              }
-            : item,
-        ),
-      )
+    const candidateTemplate = {
+      id: editingId ?? '',
+      name: nextName,
+      language: form.language,
+      content: form.content,
     }
 
-    clearEditor()
+    try {
+      setIsSyncing(true)
+
+      if (editingId === null) {
+        const created = await requestJson(TEMPLATE_API_URL, {
+          method: 'POST',
+          body: JSON.stringify(toApiPayload(candidateTemplate)),
+        })
+
+        const normalized = normalizeTemplate(created)
+        if (!normalized) throw new Error('Invalid create response')
+
+        setTemplates((prev) => [normalized, ...prev])
+        setSelectedId(normalized.id)
+      } else {
+        const updated = await requestJson(`${TEMPLATE_API_URL}/${editingId}`, {
+          method: 'PUT',
+          body: JSON.stringify(toApiPayload(candidateTemplate)),
+        })
+
+        const normalized = normalizeTemplate(updated)
+        if (!normalized) throw new Error('Invalid update response')
+
+        setTemplates((prev) =>
+          prev.map((item) =>
+            item.id === editingId
+              ? {
+                  ...item,
+                  ...normalized,
+                }
+              : item,
+          ),
+        )
+      }
+
+      clearEditor()
+    } catch {
+      alert('Save failed. Could not sync with server.')
+    } finally {
+      setIsSyncing(false)
+    }
   }
 
-  const removeSelected = () => {
+  const removeSelected = async () => {
     if (!selectedTemplate) return
 
-    const ok = window.confirm(`Xoa template "${selectedTemplate.name}"?`)
+    const ok = window.confirm(`Delete template "${selectedTemplate.name}"?\n\n${REQUEST_WARNING}`)
     if (!ok) return
 
-    setTemplates((prev) => prev.filter((item) => item.id !== selectedTemplate.id))
+    try {
+      setIsSyncing(true)
+      await requestJson(`${TEMPLATE_API_URL}/${selectedTemplate.id}`, {
+        method: 'DELETE',
+      })
+
+      setTemplates((prev) => prev.filter((item) => item.id !== selectedTemplate.id))
+    } catch {
+      alert('Delete failed. Could not sync with server.')
+    } finally {
+      setIsSyncing(false)
+    }
   }
 
   const copyCurrent = async () => {
@@ -257,57 +506,81 @@ export default function App() {
 
     try {
       await navigator.clipboard.writeText(selectedTemplate.content)
-      alert('Da copy template vao clipboard.')
+      alert('Template copied to clipboard.')
     } catch {
-      alert('Khong copy duoc. Trinh duyet dang chan clipboard.')
+      alert('Copy failed. Clipboard access is blocked.')
     }
   }
 
   const isEditing = editingId !== undefined
-  const modeLabel = editingId === null ? 'Them template moi' : 'Sua template'
+  const modeLabel = editingId === null ? 'Add New Template' : 'Edit Template'
 
   return (
     <main className="app-shell">
       <aside className="left-panel">
         <div className="panel-header">
-          <h2>Components</h2>
-          <button type="button" onClick={startCreate} className="btn-primary">
-            + Them
-          </button>
+          <div className="panel-top">
+            <h2>Components</h2>
+            <div className="panel-actions">
+              <button type="button" onClick={refetchTemplates} disabled={isSyncing}>
+                {isSyncing ? 'Loading...' : 'Refetch'}
+              </button>
+              <button type="button" onClick={startCreate} className="btn-primary">
+                + Add
+              </button>
+            </div>
+          </div>
+          <div className="search-row">
+            <input
+              type="text"
+              value={searchInput}
+              onChange={(event) => setSearchInput(event.target.value)}
+              placeholder="Search component..."
+            />
+            <button type="button" onClick={() => setSearchInput('')} disabled={!searchInput} className="clear-btn">
+              Clear
+            </button>
+          </div>
         </div>
 
         <ul className="template-list">
-          {templates.map((item) => (
+          {filteredTemplates.map((item) => (
             <li key={item.id}>
               <button
                 type="button"
                 className={`template-item ${item.id === selectedId ? 'active' : ''}`}
                 onClick={() => setSelectedId(item.id)}
               >
-                <span className="name">{item.name}</span>
+                <span className="name">{renderHighlightedName(item.name, item.highlightRanges)}</span>
                 <span className="lang">{item.language}</span>
               </button>
             </li>
           ))}
-          {!templates.length && <p className="empty">Chua co template nao.</p>}
+          {!templates.length && <p className="empty">No templates yet.</p>}
+          {!!templates.length && !filteredTemplates.length && <p className="empty">No matched components.</p>}
         </ul>
       </aside>
 
       <section className="right-panel">
         <div className="right-header">
           <div>
-            <h1>{selectedTemplate?.name ?? 'Khong co template'}</h1>
-            <p className="subtitle">Docs va template su dung component</p>
+            <h1>{selectedTemplate?.name ?? 'No template selected'}</h1>
+            <p className="subtitle">Component docs and usage template</p>
           </div>
           <div className="actions">
             <button type="button" onClick={copyCurrent} disabled={!selectedTemplate}>
               Copy
             </button>
-            <button type="button" onClick={startEdit} disabled={!selectedTemplate}>
-              Sua
+            <button type="button" onClick={startEdit} disabled={!selectedTemplate || isSyncing}>
+              Edit
             </button>
-            <button type="button" onClick={removeSelected} disabled={!selectedTemplate} className="danger">
-              Xoa
+            <button
+              type="button"
+              onClick={removeSelected}
+              disabled={!selectedTemplate || isSyncing}
+              className="danger"
+            >
+              Delete
             </button>
           </div>
         </div>
@@ -318,7 +591,7 @@ export default function App() {
               <code dangerouslySetInnerHTML={{ __html: highlightedCode }} />
             </pre>
           ) : (
-            <p className="empty">Hay tao template moi de bat dau.</p>
+            <p className="empty">Create a new template to get started.</p>
           )}
         </div>
 
@@ -327,17 +600,17 @@ export default function App() {
             <h3>{modeLabel}</h3>
 
             <label>
-              Ten template
+              Template Name
               <input
                 type="text"
                 value={form.name}
                 onChange={(event) => setForm((prev) => ({ ...prev, name: event.target.value }))}
-                placeholder="Vi du: SearchBar"
+                placeholder="Example: SearchBar"
               />
             </label>
 
             <label>
-              Kieu noi dung
+              Content Type
               <select
                 value={form.language}
                 onChange={(event) => setForm((prev) => ({ ...prev, language: event.target.value }))}
@@ -349,13 +622,13 @@ export default function App() {
             </label>
 
             <label>
-              Noi dung docs/template
+              Docs/Template Content
               <textarea
                 value={form.content}
                 onChange={(event) => setForm((prev) => ({ ...prev, content: event.target.value }))}
                 onPaste={handleContentPaste}
                 rows={12}
-                placeholder="Dan code template vao day..."
+                placeholder="Paste your template code here..."
               />
             </label>
 
@@ -365,18 +638,18 @@ export default function App() {
                 checked={autoFormatOnPaste}
                 onChange={(event) => setAutoFormatOnPaste(event.target.checked)}
               />
-              Tu format JS/JSX khi paste
+              Auto format JS/JSX on paste
             </label>
 
             <div className="editor-actions">
-              <button type="button" onClick={formatFormContent} disabled={isFormatting}>
-                {isFormatting ? 'Dang format...' : 'Format'}
+              <button type="button" onClick={formatFormContent} disabled={isFormatting || isSyncing}>
+                {isFormatting ? 'Formatting...' : 'Format'}
               </button>
-              <button type="button" onClick={clearEditor}>
-                Huy
+              <button type="button" onClick={clearEditor} disabled={isSyncing}>
+                Cancel
               </button>
-              <button type="submit" className="btn-primary">
-                Luu
+              <button type="submit" className="btn-primary" disabled={isSyncing}>
+                {isSyncing ? 'Saving...' : 'Save'}
               </button>
             </div>
           </form>

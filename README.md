@@ -9,6 +9,8 @@ Ung dung React + Vite de luu/copy nhanh template su dung component dung chung.
 - Ben phai: docs/template va syntax highlight cho `JS/JSX`, `JSON`, `Text`.
 - CRUD: them, sua, xoa template.
 - Luu du lieu vao `localStorage`.
+- Dong bo voi API `https://663484909bb0df2359a1be82.mockapi.io/template-component` cho cac thao tac them/sua/xoa.
+- Co nut `Refetch` de lay du lieu moi nhat tu server va cap nhat lai `localStorage`.
 - Nut copy nhanh noi dung template.
 - Nut `Format` trong form editor cho `JS/JSX` (js-beautify), `JSON` (parse/stringify), `Text/String` (chuan hoa whitespace).
 - Ho tro tu dong format khi paste vao o docs/template (co the bat/tat).

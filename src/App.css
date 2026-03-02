@@ -46,14 +46,38 @@ textarea {
   background: #ffffff;
   padding: 16px;
   border-bottom: 1px solid #edf2ff;
+  display: grid;
+  gap: 10px;
+}
+
+.panel-top {
   display: flex;
   align-items: center;
   justify-content: space-between;
 }
 
-.panel-header h2 {
+.panel-top h2 {
   margin: 0;
   font-size: 18px;
+}
+
+.panel-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.search-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+}
+
+.search-row input {
+  min-width: 0;
+}
+
+.clear-btn {
+  min-width: 56px;
 }
 
 .template-list {
@@ -77,6 +101,13 @@ textarea {
 .template-item .name {
   display: block;
   font-weight: 600;
+}
+
+.name-highlight {
+  background: #fde68a;
+  color: #111827;
+  border-radius: 3px;
+  padding: 0 1px;
 }
 
 .template-item .lang {
@@ -125,7 +156,9 @@ button {
   border: 1px solid #cbd5e1;
   border-radius: 8px;
   background: #fff;
-  padding: 7px 12px;
+  padding: 4px 9px;
+  font-size: 13px;
+  line-height: 1.2;
   cursor: pointer;
 }
 

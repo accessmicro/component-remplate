@@ -65,6 +65,16 @@ function highlightWithRules(source, regex, tokenClass) {
  * highlightCode('<script>alert("hi")</script>', 'text')
  */
 export function highlightCode(code, language) {
+  if (language === 'html') {
+    const regex = /(<!--[\s\S]*?-->|<\/?[A-Za-z][\w:-]*|(?:\s|^)[A-Za-z_:][\w:.-]*(?=\=)|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\/?>)/g
+    return highlightWithRules(code, regex, (value) => {
+      if (/^<!--/.test(value)) return 'comment'
+      if (/^<\/?[A-Za-z]/.test(value) || /^\/?>$/.test(value)) return 'component'
+      if (/^['"]/.test(value)) return 'string'
+      return 'key'
+    })
+  }
+
   if (language === 'json') {
     const regex = /("(?:\\.|[^"\\])*"\s*:|"(?:\\.|[^"\\])*"|-?\b\d+(?:\.\d+)?\b|\btrue\b|\bfalse\b|\bnull\b|[{}\[\],:])/g
     return highlightWithRules(code, regex, (value) => {
